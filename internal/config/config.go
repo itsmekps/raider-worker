@@ -1,6 +1,8 @@
 package config
 
 import (
+	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -81,12 +83,12 @@ func Load() *Config {
 			TLSEnabled:  getEnvBool("KAFKA_TLS_ENABLED", false),
 		},
 		Mongo: MongoConfig{
-			URI:      getEnv("MONGO_URI", "mongodb://localhost:27017"),
-			Database: getEnv("MONGO_DATABASE", "debt_recovery"),
+			URI:      buildMongoURI(),
+			Database: resolveMongoDatabase(),
 			TLS:      getEnvBool("MONGO_TLS_ENABLED", false),
 		},
 		Redis: RedisConfig{
-			URI: getEnv("REDIS_URI", "redis://localhost:6379"),
+			URI: buildRedisURI(),
 		},
 		Workers: WorkerConfig{
 			CaseCount:         getEnvInt("WORKER_CASE_COUNT", 50),
@@ -112,6 +114,51 @@ func Load() *Config {
 			MaxRetries: getEnvInt("RETRY_MAX", 5),
 		},
 	}
+}
+
+// buildRedisURI prefers discrete REDIS_HOST/REDIS_PORT/REDIS_PASSWORD vars
+// (common in deployment configs that inject credentials separately) and
+// falls back to a single REDIS_URI connection string.
+func buildRedisURI() string {
+	host := os.Getenv("REDIS_HOST")
+	if host == "" {
+		return getEnv("REDIS_URI", "redis://localhost:6379")
+	}
+
+	port := getEnv("REDIS_PORT", "6379")
+	password := os.Getenv("REDIS_PASSWORD")
+	if password == "" {
+		return fmt.Sprintf("redis://%s:%s", host, port)
+	}
+	return fmt.Sprintf("redis://:%s@%s:%s", url.QueryEscape(password), host, port)
+}
+
+// buildMongoURI prefers discrete MONGODB_HOST/MONGODB_USER/MONGODB_PASSWORD
+// vars (e.g. an Atlas SRV hostname) and falls back to a single MONGO_URI
+// connection string. When MONGODB_HOST is set, an SRV-style URI is built
+// since Atlas hosts are SRV records (mongodb+srv://...) and Atlas always
+// requires TLS.
+func buildMongoURI() string {
+	host := os.Getenv("MONGODB_HOST")
+	if host == "" {
+		return getEnv("MONGO_URI", "mongodb://localhost:27017")
+	}
+
+	dbName := resolveMongoDatabase()
+	user := os.Getenv("MONGODB_USER")
+	password := os.Getenv("MONGODB_PASSWORD")
+	if user == "" || password == "" {
+		return fmt.Sprintf("mongodb+srv://%s/%s?retryWrites=true&w=majority&tls=true", host, dbName)
+	}
+	return fmt.Sprintf("mongodb+srv://%s:%s@%s/%s?retryWrites=true&w=majority&tls=true",
+		url.QueryEscape(user), url.QueryEscape(password), host, dbName)
+}
+
+func resolveMongoDatabase() string {
+	if name := os.Getenv("MONGODB_NAME"); name != "" {
+		return name
+	}
+	return getEnv("MONGO_DATABASE", "debt_recovery")
 }
 
 func getEnv(key, fallback string) string {

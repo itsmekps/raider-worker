@@ -3,6 +3,7 @@ package retry
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -37,6 +38,20 @@ var backoffSchedule = []time.Duration{
 	5 * time.Minute,
 	15 * time.Minute,
 	30 * time.Minute,
+}
+
+// ParseRetryEnvelope deserialises a message consumed from a "<topic>.retry"
+// topic. These are not processed directly — they are handed to the
+// Scheduler, which holds them until NextRetryAfter is due.
+func ParseRetryEnvelope(raw []byte) (RetryEnvelope, error) {
+	var env RetryEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return RetryEnvelope{}, fmt.Errorf("unmarshal retry envelope: %w", err)
+	}
+	if env.EventID == "" || env.OriginalTopic == "" {
+		return RetryEnvelope{}, fmt.Errorf("invalid retry envelope: missing eventId or originalTopic")
+	}
+	return env, nil
 }
 
 // Publisher sends events to retry topics with exponential backoff metadata.

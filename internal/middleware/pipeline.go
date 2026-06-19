@@ -54,13 +54,16 @@ func (p *Pipeline) Execute(
 	// Metrics: record receipt
 	metrics.MessagesReceived.WithLabelValues(e.Topic, e.TenantID).Inc()
 
-	// Idempotency check
-	already, err := p.idempotency.IsProcessed(ctx, e.EventID)
+	// Idempotency: atomic claim. On a Redis error we fail open (proceed
+	// without dedup) rather than fail closed, since Redis is also a hard
+	// startup dependency — a transient blip here shouldn't halt the consumer.
+	acquired, err := p.idempotency.TryAcquire(ctx, e.EventID)
 	if err != nil {
-		log.Warn("idempotency check failed — proceeding without dedup", zap.Error(err))
+		log.Warn("idempotency acquire failed — proceeding without dedup", zap.Error(err))
+		acquired = true
 	}
-	if already {
-		log.Info("duplicate event skipped")
+	if !acquired {
+		log.Info("duplicate or in-flight event skipped")
 		return nil
 	}
 
@@ -98,14 +101,16 @@ func (p *Pipeline) Execute(
 			zap.Error(processingErr),
 			zap.Duration("duration", duration),
 		)
+		// Release the idempotency claim so a retry of this same eventID
+		// (retries reuse the original eventID) can be acquired again.
+		if relErr := p.idempotency.Release(ctx, e.EventID); relErr != nil {
+			log.Warn("failed to release idempotency lock after failure", zap.Error(relErr))
+		}
 		return processingErr
 	}
 
-	// Mark complete in idempotency store
-	if markErr := p.idempotency.MarkProcessed(ctx, e.EventID); markErr != nil {
-		log.Warn("failed to mark event as processed in idempotency store", zap.Error(markErr))
-	}
-
+	// On success the claim key is left in place — it now acts as the
+	// "already processed" marker until its TTL expires.
 	metrics.MessagesProcessed.WithLabelValues(e.Topic, e.EventType, e.TenantID).Inc()
 	log.Info("event processed successfully", zap.Duration("duration", duration))
 	return nil

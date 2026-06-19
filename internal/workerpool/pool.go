@@ -2,8 +2,8 @@ package workerpool
 
 import (
 	"context"
+	"hash/fnv"
 	"sync"
-	"sync/atomic"
 
 	"go.uber.org/zap"
 
@@ -17,86 +17,92 @@ type Job struct {
 	Execute func(ctx context.Context) error
 }
 
-// Pool is a bounded goroutine pool for a single topic.
-// It enforces backpressure via a buffered channel — callers block when full.
-type Pool struct {
-	topic       string
-	jobs        chan Job
-	workerCount int
-	activeCount atomic.Int64
-	wg          sync.WaitGroup
+type lane struct {
+	jobs chan Job
 }
 
-// New creates a Pool and starts workerCount goroutines immediately.
-func New(topic string, workerCount, bufferSize int) *Pool {
-	p := &Pool{
-		topic:       topic,
-		jobs:        make(chan Job, bufferSize),
-		workerCount: workerCount,
+// Pool is a key-affinity bounded worker pool for a single topic.
+// Jobs sharing the same affinity key are always routed to the same lane and
+// execute strictly in submission order — this is what preserves per-entity
+// ordering (e.g. tenant:case) even though different keys process in
+// parallel across lanes.
+type Pool struct {
+	topic string
+	lanes []*lane
+	wg    sync.WaitGroup
+}
+
+// New creates a Pool with laneCount lanes, each buffered to bufferPerLane.
+func New(topic string, laneCount, bufferPerLane int) *Pool {
+	if laneCount < 1 {
+		laneCount = 1
 	}
-	p.start()
+	if bufferPerLane < 1 {
+		bufferPerLane = 1
+	}
+
+	p := &Pool{topic: topic, lanes: make([]*lane, laneCount)}
+	for i := 0; i < laneCount; i++ {
+		l := &lane{jobs: make(chan Job, bufferPerLane)}
+		p.lanes[i] = l
+		p.wg.Add(1)
+		go p.runLane(l)
+	}
 	return p
 }
 
-func (p *Pool) start() {
-	for i := 0; i < p.workerCount; i++ {
-		p.wg.Add(1)
-		go p.runWorker()
-	}
-}
-
-func (p *Pool) runWorker() {
+func (p *Pool) runLane(l *lane) {
 	defer p.wg.Done()
-	for job := range p.jobs {
-		p.activeCount.Add(1)
-		metrics.WorkerPoolActive.WithLabelValues(p.topic).Set(float64(p.activeCount.Load()))
+	for job := range l.jobs {
+		metrics.WorkerPoolActive.WithLabelValues(p.topic).Inc()
 
 		if err := job.Execute(job.Ctx); err != nil {
 			// Errors are handled inside Execute (retry/DLQ decisions happen there).
-			// Workers never stop on error — they log at the pool level for visibility.
-			logger.Get().Debug("worker: job returned error",
-				zap.String("topic", p.topic),
-				zap.Error(err),
-			)
+			logger.Get().Debug("worker: job returned error", zap.String("topic", p.topic), zap.Error(err))
 		}
 
-		p.activeCount.Add(-1)
-		metrics.WorkerPoolActive.WithLabelValues(p.topic).Set(float64(p.activeCount.Load()))
-		metrics.WorkerPoolQueueDepth.WithLabelValues(p.topic).Set(float64(len(p.jobs)))
+		metrics.WorkerPoolActive.WithLabelValues(p.topic).Dec()
+		metrics.WorkerPoolQueueDepth.WithLabelValues(p.topic).Set(float64(p.QueueDepth()))
 	}
 }
 
-// Submit enqueues a job. Blocks when the buffer is full (backpressure).
-// Callers should check context cancellation before submitting during shutdown.
-func (p *Pool) Submit(job Job) {
-	p.jobs <- job
-	metrics.WorkerPoolQueueDepth.WithLabelValues(p.topic).Set(float64(len(p.jobs)))
+func (p *Pool) laneFor(key string) *lane {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	idx := int(h.Sum32() % uint32(len(p.lanes)))
+	return p.lanes[idx]
 }
 
-// TrySubmit attempts a non-blocking submit. Returns false when the buffer is full.
-func (p *Pool) TrySubmit(job Job) bool {
-	select {
-	case p.jobs <- job:
-		metrics.WorkerPoolQueueDepth.WithLabelValues(p.topic).Set(float64(len(p.jobs)))
-		return true
-	default:
-		return false
-	}
+// Submit enqueues a job onto the lane owned by key. Blocks only if that
+// specific lane is full — other lanes (other keys) are unaffected, which is
+// the backpressure mechanism: a single hot key throttles itself without
+// stalling unrelated entities.
+func (p *Pool) Submit(key string, job Job) {
+	l := p.laneFor(key)
+	l.jobs <- job
+	metrics.WorkerPoolQueueDepth.WithLabelValues(p.topic).Set(float64(p.QueueDepth()))
 }
 
-// QueueDepth returns the current number of pending jobs.
+// IsLaneFull reports whether the lane owned by key is currently at capacity.
+func (p *Pool) IsLaneFull(key string) bool {
+	l := p.laneFor(key)
+	return len(l.jobs) >= cap(l.jobs)
+}
+
+// QueueDepth returns the total queued jobs across all lanes.
 func (p *Pool) QueueDepth() int {
-	return len(p.jobs)
+	total := 0
+	for _, l := range p.lanes {
+		total += len(l.jobs)
+	}
+	return total
 }
 
-// IsFull returns true when the job buffer is at capacity.
-func (p *Pool) IsFull() bool {
-	return len(p.jobs) == cap(p.jobs)
-}
-
-// Stop closes the job channel and waits for all in-flight workers to finish.
+// Stop closes all lane channels and waits for every lane goroutine to drain.
 func (p *Pool) Stop() {
-	close(p.jobs)
+	for _, l := range p.lanes {
+		close(l.jobs)
+	}
 	p.wg.Wait()
 	logger.Get().Info("worker pool stopped", zap.String("topic", p.topic))
 }

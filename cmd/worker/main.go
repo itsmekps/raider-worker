@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -24,12 +25,23 @@ import (
 	"github.com/raider/worker/internal/idempotency"
 	"github.com/raider/worker/internal/logger"
 	"github.com/raider/worker/internal/middleware"
+	"github.com/raider/worker/internal/offsetmanager"
 	"github.com/raider/worker/internal/processor"
 	"github.com/raider/worker/internal/registry"
 	"github.com/raider/worker/internal/retry"
 )
 
+const (
+	offsetFlushInterval = 1 * time.Second
+	retryPollInterval   = 1 * time.Second
+)
+
 func main() {
+	// Best-effort: only present in local/dev runs. In containers, env vars
+	// are injected directly (docker-compose env_file, k8s, etc.) and no
+	// .env file exists, so a missing file here is not an error.
+	_ = godotenv.Load()
+
 	cfg := config.Load()
 
 	if err := logger.Init(cfg.Log.Level); err != nil {
@@ -80,6 +92,16 @@ func main() {
 	pingCancel2()
 	log.Info("mongodb connected")
 
+	// ── Offset manager + rebalance handler ────────────────────────────────────
+	// The offset manager needs the kafka client, but the kafka client's
+	// rebalance options need the handler that wraps the offset manager —
+	// constructed before the client exists. Resolved with two-phase init:
+	// the client reference is attached right after NewClient returns, and
+	// well before the poll loop starts (which is the only thing that can
+	// trigger a rebalance callback).
+	offsetMgr := offsetmanager.New(nil, offsetFlushInterval)
+	rebalanceHandler := consumer.NewRebalanceHandler(offsetMgr)
+
 	// ── Kafka client (franz-go) ──────────────────────────────────────────────
 	allTopics := append(cfg.Kafka.Topics, cfg.Kafka.RetryTopics...)
 
@@ -88,9 +110,9 @@ func main() {
 		kgo.ConsumerGroup(cfg.Kafka.GroupID),
 		kgo.ConsumeTopics(allTopics...),
 		kgo.DisableAutoCommit(),
-		kgo.OnPartitionsAssigned(rebalanceHook.OnPartitionsAssigned),
-		kgo.OnPartitionsRevoked(rebalanceHook.OnPartitionsRevoked),
-		kgo.OnPartitionsLost(rebalanceHook.OnPartitionsLost),
+		kgo.OnPartitionsAssigned(rebalanceHandler.OnPartitionsAssigned),
+		kgo.OnPartitionsRevoked(rebalanceHandler.OnPartitionsRevoked),
+		kgo.OnPartitionsLost(rebalanceHandler.OnPartitionsLost),
 	}
 	if cfg.Kafka.TLSEnabled {
 		kopts = append(kopts, kgo.DialTLSConfig(&tls.Config{MinVersion: tls.VersionTLS12}))
@@ -111,12 +133,14 @@ func main() {
 		log.Fatal("kafka client init failed", zap.Error(err))
 	}
 	defer kafkaClient.Close()
+	offsetMgr.SetClient(kafkaClient)
 	log.Info("kafka client connected", zap.Strings("brokers", cfg.Kafka.Brokers))
 
 	// ── Core services ────────────────────────────────────────────────────────
 	idempotencyStore := idempotency.NewRedisStore(redisClient)
 	dlqPublisher := dlq.NewPublisher(kafkaClient)
 	retryPublisher := retry.NewPublisher(kafkaClient, cfg.Retry.MaxRetries)
+	retryScheduler := retry.NewScheduler(redisClient, kafkaClient, retryPollInterval)
 
 	// ── Registry — register all processors here ──────────────────────────────
 	reg := registry.New()
@@ -129,7 +153,7 @@ func main() {
 	pipeline := middleware.NewPipeline(idempotencyStore, cfg.Timeouts.KafkaProcessing)
 
 	// ── Consumer ─────────────────────────────────────────────────────────────
-	cons := consumer.New(cfg, kafkaClient, reg, pipeline, retryPublisher, dlqPublisher)
+	cons := consumer.New(cfg, kafkaClient, reg, pipeline, retryPublisher, retryScheduler, dlqPublisher, offsetMgr)
 
 	// ── Health server ─────────────────────────────────────────────────────────
 	healthCheckers := map[string]health.Checker{
@@ -153,7 +177,9 @@ func main() {
 		}
 	}()
 
-	// ── Start consumer ────────────────────────────────────────────────────────
+	// ── Start background components ───────────────────────────────────────────
+	go offsetMgr.Start(ctx)
+	go retryScheduler.Run(ctx)
 	go cons.Start(ctx)
 	log.Info("worker running — waiting for shutdown signal")
 
@@ -165,10 +191,14 @@ func main() {
 	log.Info("shutdown signal received")
 	cancel() // stop the consumer poll loop
 
-	cons.Stop() // drain worker pools and flush offsets
+	cons.Stop() // drain worker pools — all in-flight Complete() calls land before this returns
 
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutCancel()
+
+	offsetMgr.FlushAll(shutCtx) // final commit of everything pools just completed
+	offsetMgr.Stop()
+	retryScheduler.Stop()
 
 	healthServer.Stop(shutCtx)
 
@@ -178,9 +208,6 @@ func main() {
 
 	log.Info("shutdown complete")
 }
-
-// rebalanceHook is a package-level singleton used in the kgo options closure.
-var rebalanceHook = &consumer.RebalanceHandler{}
 
 // ── Lightweight health check adapters ────────────────────────────────────────
 

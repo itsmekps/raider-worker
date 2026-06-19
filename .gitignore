@@ -1,0 +1,15 @@
+# Secrets / local config
+.env
+.env.local
+
+# Build artifacts
+/worker
+/bin/
+
+# Go
+*.test
+*.out
+
+# IDE
+.vscode/
+.idea/

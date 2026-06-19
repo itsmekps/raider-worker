@@ -20,7 +20,7 @@ type Event struct {
 	Partition int32
 	Offset    int64
 
-	// Retry metadata — populated when reprocessing from a retry topic.
+	// Retry metadata — populated when reprocessing a republished retry.
 	RetryCount       int
 	FailureReason    string
 	FirstFailureTime *time.Time

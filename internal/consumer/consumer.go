@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,20 +15,28 @@ import (
 	"github.com/raider/worker/internal/event"
 	"github.com/raider/worker/internal/logger"
 	"github.com/raider/worker/internal/middleware"
+	"github.com/raider/worker/internal/offsetmanager"
 	"github.com/raider/worker/internal/registry"
 	"github.com/raider/worker/internal/retry"
 	"github.com/raider/worker/internal/workerpool"
 )
 
 // Consumer owns the franz-go client, worker pools, and the main polling loop.
+//
+// Offsets are never committed by workers. Every dispatch path — success,
+// DLQ, or handoff to the retry scheduler — ends in offsets.Complete(), and
+// only the Manager decides what is safe to commit (the highest contiguous
+// completed offset per partition). See internal/offsetmanager.
 type Consumer struct {
-	cfg      *config.Config
-	client   *kgo.Client
-	registry *registry.Registry
-	pipeline *middleware.Pipeline
-	retry    *retry.Publisher
-	dlq      *dlq.Publisher
-	pools    map[string]*workerpool.Pool
+	cfg       *config.Config
+	client    *kgo.Client
+	registry  *registry.Registry
+	pipeline  *middleware.Pipeline
+	retry     *retry.Publisher
+	scheduler *retry.Scheduler
+	dlq       *dlq.Publisher
+	offsets   *offsetmanager.Manager
+	pools     map[string]*workerpool.Pool
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -39,24 +48,36 @@ func New(
 	reg *registry.Registry,
 	pipeline *middleware.Pipeline,
 	retryPub *retry.Publisher,
+	scheduler *retry.Scheduler,
 	dlqPub *dlq.Publisher,
+	offsets *offsetmanager.Manager,
 ) *Consumer {
+	bufferPerLane := func(laneCount int) int {
+		b := cfg.Workers.QueueBufferSize / laneCount
+		if b < 50 {
+			b = 50
+		}
+		return b
+	}
+
 	pools := map[string]*workerpool.Pool{
-		"cases":         workerpool.New("cases", cfg.Workers.CaseCount, cfg.Workers.QueueBufferSize),
-		"payments":      workerpool.New("payments", cfg.Workers.PaymentCount, cfg.Workers.QueueBufferSize),
-		"visits":        workerpool.New("visits", cfg.Workers.VisitCount, cfg.Workers.QueueBufferSize),
-		"notifications": workerpool.New("notifications", cfg.Workers.NotificationCount, cfg.Workers.QueueBufferSize),
+		"cases":         workerpool.New("cases", cfg.Workers.CaseCount, bufferPerLane(cfg.Workers.CaseCount)),
+		"payments":      workerpool.New("payments", cfg.Workers.PaymentCount, bufferPerLane(cfg.Workers.PaymentCount)),
+		"visits":        workerpool.New("visits", cfg.Workers.VisitCount, bufferPerLane(cfg.Workers.VisitCount)),
+		"notifications": workerpool.New("notifications", cfg.Workers.NotificationCount, bufferPerLane(cfg.Workers.NotificationCount)),
 	}
 
 	return &Consumer{
-		cfg:      cfg,
-		client:   client,
-		registry: reg,
-		pipeline: pipeline,
-		retry:    retryPub,
-		dlq:      dlqPub,
-		pools:    pools,
-		stopCh:   make(chan struct{}),
+		cfg:       cfg,
+		client:    client,
+		registry:  reg,
+		pipeline:  pipeline,
+		retry:     retryPub,
+		scheduler: scheduler,
+		dlq:       dlqPub,
+		offsets:   offsets,
+		pools:     pools,
+		stopCh:    make(chan struct{}),
 	}
 }
 
@@ -98,29 +119,38 @@ func (c *Consumer) Start(ctx context.Context) {
 				Key:       rec.Key,
 				Value:     rec.Value,
 			}
-			c.dispatch(ctx, raw, rec)
+			// Track must happen here, synchronously, in strict poll order —
+			// this is what lets the offset manager know the true earliest
+			// in-flight offset per partition.
+			c.offsets.Track(raw.Topic, raw.Partition, raw.Offset, rec.LeaderEpoch)
+			c.dispatch(ctx, raw)
 		})
 	}
 }
 
-// dispatch routes a single raw Kafka record to the correct worker pool.
-func (c *Consumer) dispatch(ctx context.Context, raw event.RawMessage, rec *kgo.Record) {
+// dispatch routes a single raw Kafka record. Retry-topic messages are handed
+// to the scheduler (not processed); everything else goes through the normal
+// envelope → registry → worker-pool path.
+func (c *Consumer) dispatch(ctx context.Context, raw event.RawMessage) {
+	if strings.HasSuffix(raw.Topic, ".retry") {
+		c.dispatchRetry(ctx, raw)
+		return
+	}
+
 	log := logger.With(
 		zap.String("topic", raw.Topic),
 		zap.Int32("partition", raw.Partition),
 		zap.Int64("offset", raw.Offset),
 	)
 
-	// Parse and validate envelope — non-retriable on failure.
 	e, err := event.ParseAndValidate(raw)
 	if err != nil {
 		log.Warn("envelope parse failed — sending to DLQ", zap.Error(err))
 		c.dlq.PublishRaw(ctx, raw, err.Error())
-		c.commitOffset(ctx, rec)
+		c.offsets.Complete(raw.Topic, raw.Partition, raw.Offset)
 		return
 	}
 
-	// Resolve processor before dispatching to the pool.
 	processor, err := c.registry.Resolve(e.EventType, e.Version)
 	if err != nil {
 		var unknown *event.ErrUnknownEventType
@@ -135,22 +165,22 @@ func (c *Consumer) dispatch(ctx context.Context, raw event.RawMessage, rec *kgo.
 			log.Error("registry resolve error", zap.Error(err))
 		}
 		c.dlq.Publish(ctx, e, raw.Value, err.Error(), 0)
-		c.commitOffset(ctx, rec)
+		c.offsets.Complete(raw.Topic, raw.Partition, raw.Offset)
 		return
 	}
 
-	pool, ok := c.pools[topicBase(raw.Topic)]
+	pool, ok := c.pools[raw.Topic]
 	if !ok {
 		log.Warn("no pool configured for topic — dropping to DLQ", zap.String("topic", raw.Topic))
 		c.dlq.Publish(ctx, e, raw.Value, "no worker pool for topic", 0)
-		c.commitOffset(ctx, rec)
+		c.offsets.Complete(raw.Topic, raw.Partition, raw.Offset)
 		return
 	}
 
-	// Backpressure: pause topic fetching when queue is saturated.
-	if pool.IsFull() {
-		log.Warn("worker pool full — pausing fetch", zap.String("topic", raw.Topic))
-		c.client.PauseFetchTopics(raw.Topic)
+	key := e.AffinityKey()
+	if pool.IsLaneFull(key) {
+		log.Warn("worker lane saturated — backpressure engaged",
+			zap.String("topic", raw.Topic), zap.String("affinityKey", key))
 	}
 
 	processorName := e.EventType
@@ -158,18 +188,52 @@ func (c *Consumer) dispatch(ctx context.Context, raw event.RawMessage, rec *kgo.
 	capturedRaw := make([]byte, len(raw.Value))
 	copy(capturedRaw, raw.Value)
 
-	pool.Submit(workerpool.Job{
+	pool.Submit(key, workerpool.Job{
 		Ctx: ctx,
 		Execute: func(jobCtx context.Context) error {
-			defer c.commitOffset(jobCtx, rec)
+			defer c.offsets.Complete(raw.Topic, raw.Partition, raw.Offset)
 			return c.processWithFallback(jobCtx, capturedEvent, capturedRaw, processorName, processor)
 		},
 	})
+}
 
-	// Resume once there is room again.
-	if !pool.IsFull() {
-		c.client.ResumeFetchTopics(raw.Topic)
+// dispatchRetry hands a "<topic>.retry" message to the scheduler instead of
+// processing it. The scheduler durably persists it in Redis and republishes
+// to the original topic when its backoff window elapses.
+func (c *Consumer) dispatchRetry(ctx context.Context, raw event.RawMessage) {
+	defer c.offsets.Complete(raw.Topic, raw.Partition, raw.Offset)
+
+	log := logger.With(
+		zap.String("topic", raw.Topic),
+		zap.Int32("partition", raw.Partition),
+		zap.Int64("offset", raw.Offset),
+	)
+
+	env, err := retry.ParseRetryEnvelope(raw.Value)
+	if err != nil {
+		log.Error("invalid retry envelope — sending to DLQ", zap.Error(err))
+		c.dlq.PublishRaw(ctx, raw, "invalid retry envelope: "+err.Error())
+		return
 	}
+
+	var scheduleErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if scheduleErr = c.scheduler.Schedule(ctx, env); scheduleErr == nil {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	log.Error("failed to persist retry schedule after retries — sending to DLQ",
+		zap.String("eventId", env.EventID), zap.Error(scheduleErr))
+	c.dlq.Publish(ctx, event.Event{
+		EventID:   env.EventID,
+		EventType: env.EventType,
+		TenantID:  env.TenantID,
+		Topic:     env.OriginalTopic,
+		Partition: raw.Partition,
+		Offset:    raw.Offset,
+	}, raw.Value, "failed to schedule retry: "+scheduleErr.Error(), env.RetryCount)
 }
 
 // processWithFallback runs the middleware pipeline and routes errors to retry or DLQ.
@@ -193,21 +257,10 @@ func (c *Consumer) processWithFallback(
 	return err
 }
 
-// commitOffset manually commits the processed record's offset.
-func (c *Consumer) commitOffset(ctx context.Context, rec *kgo.Record) {
-	if err := c.client.CommitRecords(ctx, rec); err != nil {
-		if !errors.Is(err, context.Canceled) {
-			logger.Get().Error("failed to commit offset",
-				zap.String("topic", rec.Topic),
-				zap.Int32("partition", rec.Partition),
-				zap.Int64("offset", rec.Offset),
-				zap.Error(err),
-			)
-		}
-	}
-}
-
-// Stop signals shutdown: stops polling, drains pools, then flushes offsets.
+// Stop signals shutdown: stops polling, drains every partition's in-flight
+// work via the offset manager, then does a final flush. The offset manager
+// itself is started/stopped by main.go since it outlives a single Stop call
+// (it needs to flush once more after pools fully drain).
 func (c *Consumer) Stop() {
 	c.stopOnce.Do(func() {
 		logger.Get().Info("consumer stopping — draining worker pools")
@@ -224,22 +277,6 @@ func (c *Consumer) Stop() {
 		}
 		wg.Wait()
 
-		flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := c.client.CommitUncommittedOffsets(flushCtx); err != nil {
-			logger.Get().Error("failed to flush offsets on shutdown", zap.Error(err))
-		}
-
 		logger.Get().Info("consumer stopped cleanly")
 	})
-}
-
-// topicBase strips .retry / .dlq suffixes to find the base pool key.
-func topicBase(topic string) string {
-	for _, suffix := range []string{".retry", ".dlq"} {
-		if len(topic) > len(suffix) && topic[len(topic)-len(suffix):] == suffix {
-			return topic[:len(topic)-len(suffix)]
-		}
-	}
-	return topic
 }

@@ -7,12 +7,19 @@ import (
 )
 
 type rawEnvelope struct {
-	Version   int             `json:"version"`
-	EventID   string          `json:"eventId"`
-	EventType string          `json:"eventType"`
-	TenantID  string          `json:"tenantId"`
-	Timestamp string          `json:"timestamp"`
-	Data      json.RawMessage `json:"data"`
+	Version          int             `json:"version"`
+	EventID          string          `json:"eventId"`
+	EventType        string          `json:"eventType"`
+	TenantID         string          `json:"tenantId"`
+	Timestamp        string          `json:"timestamp"`
+	Data             json.RawMessage `json:"data"`
+
+	// Optional — only present when this envelope is a retry republished by
+	// the retry scheduler. Carries the retry count and failure context
+	// forward so backoff and max-retry checks see the correct history.
+	RetryCount       int    `json:"retryCount,omitempty"`
+	FailureReason    string `json:"failureReason,omitempty"`
+	FirstFailureTime string `json:"firstFailureTime,omitempty"`
 }
 
 // ParseAndValidate deserialises the raw bytes and validates all mandatory fields.
@@ -26,25 +33,39 @@ func ParseAndValidate(raw RawMessage) (Event, error) {
 		return Event{}, err
 	}
 
-	ts, err := time.Parse(time.RFC3339, env.Timestamp)
+	ts, err := parseTimestamp(env.Timestamp)
 	if err != nil {
-		ts, err = time.Parse("2006-01-02T15:04:05Z", env.Timestamp)
-		if err != nil {
-			return Event{}, &ErrInvalidEnvelope{Reason: fmt.Sprintf("invalid timestamp: %s", env.Timestamp)}
+		return Event{}, &ErrInvalidEnvelope{Reason: fmt.Sprintf("invalid timestamp: %s", env.Timestamp)}
+	}
+
+	var firstFailure *time.Time
+	if env.FirstFailureTime != "" {
+		if ff, err := parseTimestamp(env.FirstFailureTime); err == nil {
+			firstFailure = &ff
 		}
 	}
 
 	return Event{
-		Version:   env.Version,
-		EventID:   env.EventID,
-		EventType: env.EventType,
-		TenantID:  env.TenantID,
-		Timestamp: ts,
-		Data:      env.Data,
-		Topic:     raw.Topic,
-		Partition: raw.Partition,
-		Offset:    raw.Offset,
+		Version:          env.Version,
+		EventID:          env.EventID,
+		EventType:        env.EventType,
+		TenantID:         env.TenantID,
+		Timestamp:        ts,
+		Data:             env.Data,
+		Topic:            raw.Topic,
+		Partition:        raw.Partition,
+		Offset:           raw.Offset,
+		RetryCount:       env.RetryCount,
+		FailureReason:    env.FailureReason,
+		FirstFailureTime: firstFailure,
 	}, nil
+}
+
+func parseTimestamp(s string) (time.Time, error) {
+	if ts, err := time.Parse(time.RFC3339, s); err == nil {
+		return ts, nil
+	}
+	return time.Parse("2006-01-02T15:04:05Z", s)
 }
 
 func validateMandatoryFields(env rawEnvelope) error {
